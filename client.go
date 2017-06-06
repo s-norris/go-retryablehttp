@@ -1,3 +1,7 @@
+//MODIFIED from original hashicorp/go-retryablehttp repo to enable inspection
+//and logging of response body while still being able to access the most
+//recent body returned when Do() finishes
+
 // The retryablehttp package provides a familiar HTTP client interface with
 // automatic retries and exponential backoff. It is a thin wrapper over the
 // standard net/http client library and exposes nearly the same public API.
@@ -105,7 +109,10 @@ type ResponseLogHook func(*log.Logger, *http.Response)
 // Client will close any response body when retrying, but if the retry is
 // aborted it is up to the CheckResponse callback to properly close any
 // response body before returning.
-type CheckRetry func(resp *http.Response, err error) (bool, error)
+
+//Added 3rd response param that can contain the content of resp.Body if it
+//has been read in the process or checking if we should retry
+type CheckRetry func(resp *http.Response, err error) (bool, error, []byte)
 
 // Client is used to make HTTP requests. It adds additional functionality
 // like automatic retries to tolerate minor outages.
@@ -128,6 +135,10 @@ type Client struct {
 	// CheckRetry specifies the policy for handling retries, and is called
 	// after each request. The default policy is DefaultRetryPolicy.
 	CheckRetry CheckRetry
+
+	//added to allow retention of the most recent response even after
+	//it has been read and the response reader has been drained
+	LastResponseBody []byte
 }
 
 // NewClient creates a new Client with default settings.
@@ -144,19 +155,20 @@ func NewClient() *Client {
 
 // DefaultRetryPolicy provides a default callback for Client.CheckRetry, which
 // will retry on connection errors and server errors.
-func DefaultRetryPolicy(resp *http.Response, err error) (bool, error) {
+// Updated to match new CheckRetry signature
+func DefaultRetryPolicy(resp *http.Response, err error) (bool, error, []byte) {
 	if err != nil {
-		return true, err
+		return true, err, nil
 	}
 	// Check the response code. We retry on 500-range responses to allow
 	// the server time to recover, as 500's are typically not permanent
 	// errors and may relate to outages on the server side. This will catch
 	// invalid response codes as well, like 0 and 999.
 	if resp.StatusCode == 0 || resp.StatusCode >= 500 {
-		return true, nil
+		return true, nil, nil
 	}
 
-	return false, nil
+	return false, nil, nil
 }
 
 // Do wraps calling an HTTP method with retries.
@@ -180,8 +192,12 @@ func (c *Client) Do(req *Request) (*http.Response, error) {
 		// Attempt the request
 		resp, err := c.HTTPClient.Do(req.Request)
 
-		// Check if we should continue with retries.
-		checkOK, checkErr := c.CheckRetry(resp, err)
+		// Check if we should continue with retries. Now saves
+		// the response data for access outside of Do()
+		checkOK, checkErr, data := c.CheckRetry(resp, err)
+		if len(data) > 0 {
+			c.LastResponseBody = data
+		}
 
 		if err != nil {
 			c.Logger.Printf("[ERR] %s %s request failed: %v", req.Method, req.URL, err)
